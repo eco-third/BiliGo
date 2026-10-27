@@ -86,6 +86,14 @@ def _selftest_download(url: str) -> int:
     work = os.path.join(tempfile.gettempdir(), "biligo-exe-selftest")
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work, exist_ok=True)
+    # --windowed 打包后没有控制台，把 stderr 接到文件，才能看到 yt-dlp/aria2c 的原始报错
+    try:
+        _diag = open(os.path.join(APP_DIR, "selftest.stderr.log"), "w",
+                     encoding="utf-8", errors="replace")
+        sys.stdout = _diag
+        sys.stderr = _diag
+    except OSError:
+        pass
     try:
         from biligo.auth import BiliAuth
         from biligo.burn import burn_danmaku, probe_video
