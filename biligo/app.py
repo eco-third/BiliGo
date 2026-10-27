@@ -14,6 +14,7 @@ from PIL import Image, ImageTk
 from .config import Config
 from .downloader import BiliDownloader
 from .danmaku import DanmakuProcessor
+from .burn import burn_danmaku, probe_video, BurnCancelled
 from .subtitle import SubtitleProcessor
 from .auth import BiliAuth
 
@@ -49,6 +50,7 @@ class BiliGoApp(ctk.CTk):
 
         self._is_downloading = False
         self._video_info = None
+        self._video_ids = {}       # cid / bvid / aid / ep_id（弹幕、字幕要用）
         self._stop_event = threading.Event()
         self._part_vars = []  # 多P复选框变量列表
         self._part_checkboxes = []  # 多P复选框控件列表
@@ -422,10 +424,13 @@ class BiliGoApp(ctk.CTk):
         ctk.CTkLabel(row1, text="画质:", font=ctk.CTkFont(size=13),
                      text_color=TEXT_DIM).pack(side="left")
 
-        self.quality_var = ctk.StringVar(value=self.config.get("quality", "4K 超清"))
+        # 清晰度选项在解析后会被替换成「该视频真实支持的档位」（见 _apply_quality_options）。
+        # 解析之前先放一套常用档位，并把上次选过的档位并进去，避免下拉框显示空值。
+        saved_quality = self.config.get("quality", "1080P")
+        self.quality_var = ctk.StringVar(value=saved_quality)
         self.quality_menu = ctk.CTkOptionMenu(
             row1,
-            values=Config.QUALITY_LIST,
+            values=list(dict.fromkeys([saved_quality] + list(Config.QUALITY_LIST))),
             variable=self.quality_var,
             width=160, height=32,
             font=ctk.CTkFont(size=12),
@@ -471,7 +476,7 @@ class BiliGoApp(ctk.CTk):
 
         self.danmaku_var = ctk.BooleanVar(value=self.config.get("download_danmaku", True))
         ctk.CTkCheckBox(
-            row2, text="下载弹幕", variable=self.danmaku_var,
+            row2, text="下载弹幕（含弹幕版）", variable=self.danmaku_var,
             font=ctk.CTkFont(size=13),
             checkbox_width=20, checkbox_height=20,
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
@@ -593,6 +598,7 @@ class BiliGoApp(ctk.CTk):
             try:
                 info = self.downloader.fetch_info(url)
                 self._video_info = info
+                self._video_ids = {}      # 换了链接就重新解析 cid/bvid
 
                 is_multi_p = bool(info.get("entries"))
 
@@ -621,6 +627,7 @@ class BiliGoApp(ctk.CTk):
 
                 # 统一更新 UI（此时信息已补全）
                 self.after(0, lambda: self._update_video_info(info))
+                self.after(0, lambda: self._apply_quality_options(info.get("quality_options") or []))
                 self.after(0, lambda: self._log(f"解析成功: {info['title']}"))
 
                 if info.get("uploader"):
@@ -662,11 +669,54 @@ class BiliGoApp(ctk.CTk):
                 self.after(0, lambda: self.download_btn.configure(state="normal"))
 
             except Exception as e:
-                self.after(0, lambda: self._log(f"解析失败: {e}", ERROR))
+                self.after(0, lambda err=e: self._log(f"解析失败: {err}", ERROR))
             finally:
                 self.after(0, lambda: self.fetch_btn.configure(text="解析", state="normal"))
 
         threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _apply_quality_options(self, options: list):
+        """按视频自己支持的清晰度重建下拉框（和 B 站播放器保持一致）。
+
+        options 形如 [{"label": "4K 超清", ...}, {"label": "1080P", ...}]，已按清晰度从高到低排好。
+        选中的档位规则：
+          1. 之前选的那档这个视频也支持 → 保持不变；
+          2. 否则优先落到 1080P（B 站网页默认），没有就落在最高一档。
+        """
+        labels = [o.get("label", "") for o in options if o.get("label")]
+        if not labels:
+            labels = list(Config.QUALITY_LIST)
+
+        self.quality_menu.configure(values=labels)
+        current = self.quality_var.get()
+        if current in labels:
+            chosen = current
+        else:
+            chosen = next((l for l in labels if l == "1080P"), "")
+            if not chosen:
+                chosen = next((l for l in labels if l.startswith("1080P")), "")
+            if not chosen:
+                chosen = labels[0]
+        self.quality_var.set(chosen)
+
+        self._log(f"可选清晰度: {', '.join(labels)}")
+        # 把每档的分辨率/帧率/HDR/码率/体积也打出来：
+        # 「HDR 真彩」说的是色彩，不是帧率；不打出来很容易误以为选错了
+        for o in options:
+            if not o.get("label"):
+                continue
+            dyn = (o.get("dynamic_range") or "SDR").upper()
+            parts = [
+                f"{o.get('width')}x{o.get('height')}",
+                f"{round(float(o.get('fps') or 0))}fps",
+                "SDR" if dyn in ("SDR", "") else dyn,
+                (lambda t: f"{t / 1000:.0f}Mbps" if t >= 1000 else f"{t:.0f}Kbps")(o.get('tbr') or 0),
+            ]
+            if o.get("filesize"):
+                parts.append(f"约{o['filesize'] / 1048576:.0f}MB")
+            self._log(f"    {o['label']}: " + "  ".join(parts))
+        if chosen != current:
+            self._log(f"当前清晰度已切换为: {chosen}", WARNING)
 
     def _update_video_info(self, info: dict):
         """更新视频信息显示"""
@@ -785,15 +835,29 @@ class BiliGoApp(ctk.CTk):
                     self.after(0, lambda: self._log(progress.vip_hint, WARNING))
 
                 if progress.status == "done":
-                    video_path = self.downloader.get_download_path_for(self._video_info)
+                    video_path = progress.output_path or \
+                        self.downloader.get_download_path_for(self._video_info)
+                    if progress.output_path:
+                        self.after(0, lambda p=progress.output_path: self._log(
+                            f"视频已保存: {p}", SUCCESS))
+                    else:
+                        self.after(0, lambda p=video_path: self._log(
+                            f"视频已保存: {p}", SUCCESS))
 
-                    # 2. 下载弹幕
+                    # 2. 下载弹幕（只生成 .ass，烧录放到最后，别挡住字幕下载）
+                    ass_path = None
                     if self.danmaku_var.get():
-                        self._download_danmaku(video_path)
+                        self.after(0, lambda: self._log(
+                            "已勾选弹幕：除原片外还会额外生成「弹幕版」视频"))
+                        ass_path = self._download_danmaku(video_path)
 
                     # 3. 下载字幕
                     if self.subtitle_var.get():
                         self._download_subtitle(video_path)
+
+                    # 4. 把弹幕烧进画面，生成第二个文件
+                    if ass_path:
+                        self._burn_danmaku_version(video_path, ass_path)
 
                     self.after(0, self._on_download_done)
                 elif progress.status == "cancelled":
@@ -805,7 +869,7 @@ class BiliGoApp(ctk.CTk):
                     self.after(0, self._on_download_done)
 
             except Exception as e:
-                self.after(0, lambda: self._log(f"下载出错: {e}", ERROR))
+                self.after(0, lambda err=e: self._log(f"下载出错: {err}", ERROR))
                 self.after(0, self._on_download_done)
 
         threading.Thread(target=do_download, daemon=True).start()
@@ -829,6 +893,12 @@ class BiliGoApp(ctk.CTk):
             self.status_label.configure(text="正在合并音视频...", text_color=WARNING)
             self.speed_label.configure(text="")
             self.progress_bar.set(1.0)
+        elif p.status == "burning":
+            pct = min(max(p.percent, 0), 100)
+            self.progress_bar.set(pct / 100)
+            self.status_label.configure(
+                text=f"正在生成弹幕版... {pct:.0f}%", text_color=WARNING)
+            self.speed_label.configure(text="")
 
         if self._is_downloading:
             self.after(300, self._update_progress)
@@ -848,54 +918,148 @@ class BiliGoApp(ctk.CTk):
         self.speed_label.configure(text="")
         self.progress_bar.set(1.0 if self.downloader.progress.status == "done" else 0)
 
-    def _download_danmaku(self, video_path: str):
-        """下载弹幕"""
+    def _download_danmaku(self, video_path: str) -> str:
+        """下载弹幕并保存为与视频同名的 .ass
+
+        Returns:
+            ASS 文件路径；失败或没有弹幕时返回空字符串
+        """
         self.after(0, lambda: self._log("正在下载弹幕..."))
         try:
             cid = self._get_cid()
-            if cid:
-                cookies = self._get_cookies()
-                # 下载多个分段
-                all_danmaku = []
-                for seg in range(1, 4):
-                    dm_list = self.danmaku_proc.download_danmaku(cid, cookies, seg)
-                    if not dm_list:
-                        break
-                    all_danmaku.extend(dm_list)
-
-                if all_danmaku:
-                    ass_path = self.danmaku_proc.save_ass(all_danmaku, video_path)
-                    self.after(0, lambda: self._log(f"弹幕已保存: {os.path.basename(ass_path)} ({len(all_danmaku)} 条)", SUCCESS))
-                else:
-                    self.after(0, lambda: self._log("该视频暂无弹幕", WARNING))
-            else:
+            if not cid:
                 self.after(0, lambda: self._log("无法获取 CID，跳过弹幕下载", WARNING))
+                return ""
+
+            cookies = self._get_cookies()
+            # 按 6 分钟一段拉。注意 B 站有时会忽略 segment_index、每段都返回同一份数据，
+            # 所以这里按「单条弹幕」去重，并且一整段没有新内容就停 —— 否则会存成好几倍重复。
+            duration = int((self._video_info or {}).get("duration") or 0)
+            seg_count = min(max(1, (duration + 359) // 360), 30) if duration else 1
+
+            seen = set()
+            all_danmaku = []
+            for seg in range(1, seg_count + 1):
+                dm_list = self.danmaku_proc.download_danmaku(cid, cookies, seg)
+                if not dm_list:
+                    break
+                fresh = 0
+                for dm in dm_list:
+                    key = (round(dm.time, 2), dm.mode, dm.text)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    all_danmaku.append(dm)
+                    fresh += 1
+                if fresh == 0:
+                    break
+
+            if all_danmaku:
+                # 用视频真实分辨率做 ASS 画布：竖屏/非 16:9 的视频才不会挤在一起
+                size_info = self._probe_video_size(video_path)
+                ass_path = self.danmaku_proc.save_ass(
+                    all_danmaku, video_path, size_info["width"], size_info["height"])
+                self.after(0, lambda p=ass_path, n=len(all_danmaku): self._log(
+                    f"弹幕已保存: {p} ({n} 条)", SUCCESS))
+                return ass_path
+            self.after(0, lambda: self._log("该视频暂无弹幕", WARNING))
+            return ""
         except Exception as e:
-            self.after(0, lambda: self._log(f"弹幕下载失败: {e}", ERROR))
+            self.after(0, lambda err=e: self._log(f"弹幕下载失败: {err}", ERROR))
+            return ""
+
+    def _probe_video_size(self, video_path: str) -> dict:
+        """探测视频真实分辨率（拿不到就退回 1920x1080）"""
+        info = {"width": 1920, "height": 1080}
+        ffmpeg = self.config.get_ffmpeg_path()
+        if not ffmpeg:
+            return info
+        probed = probe_video(video_path, ffmpeg)
+        if probed.get("width") and probed.get("height"):
+            info["width"] = probed["width"]
+            info["height"] = probed["height"]
+        return info
+
+    def _burn_danmaku_version(self, video_path: str, ass_path: str):
+        """把弹幕烧进画面，生成「标题.弹幕版.mp4」；原片保持不动"""
+        base, ext = os.path.splitext(video_path)
+        if ext.lower() not in (".mp4", ".mkv", ".mov"):
+            ext = ".mp4"
+        out_path = f"{base}.弹幕版{ext}"
+
+        ffmpeg = self.config.get_ffmpeg_path()
+        if not ffmpeg:
+            self.after(0, lambda: self._log("未安装 FFmpeg，跳过生成弹幕版", WARNING))
+            return
+
+        # 先探一下规格，大视频给个耗时提示（4K 重编码真的很久）
+        spec = probe_video(video_path, ffmpeg)
+        if spec.get("height", 0) >= 2000 or spec.get("duration", 0) > 1800:
+            self.after(0, lambda h=spec.get("height", 0), d=spec.get("duration", 0):
+                       self._log(
+                           f"源视频 {h}p / {d / 60:.0f} 分钟，重新编码可能需要较长时间，"
+                           f"期间可以点「取消」", WARNING))
+        self.after(0, lambda: self._log(
+            "正在生成弹幕版（需要重新编码，视频越长越慢，可点「取消」中断）..."))
+        progress = self.downloader.progress
+        progress.status = "burning"
+        progress.percent = 0
+
+        def on_progress(pct):
+            progress.percent = pct
+
+        try:
+            result = burn_danmaku(
+                video_path, ass_path, out_path, ffmpeg,
+                on_progress=on_progress,
+                is_cancelled=lambda: self._stop_event.is_set(),
+            )
+            size_mb = os.path.getsize(out_path) / 1048576
+            if result.get("hdr"):
+                self.after(0, lambda: self._log(
+                    "源视频是 HDR，弹幕版已转成 SDR（不转的话白字会发灰）", WARNING))
+            self.after(0, lambda p=out_path, m=size_mb: self._log(
+                f"弹幕版已保存: {p} ({m:.0f}MB)", SUCCESS))
+        except BurnCancelled:
+            self.after(0, lambda: self._log("已取消生成弹幕版", WARNING))
+        except Exception as e:
+            self.after(0, lambda err=e: self._log(f"生成弹幕版失败: {err}", ERROR))
+        finally:
+            progress.status = "done"
+            progress.percent = 100
 
     def _download_subtitle(self, video_path: str):
         """下载字幕"""
         self.after(0, lambda: self._log("正在下载字幕..."))
         try:
-            bvid = self._video_info.get("bvid", "")
-            cid = self._get_cid()
-            if bvid and cid:
-                cookies = self._get_cookies()
-                sub_info = self.subtitle_proc.get_subtitle_info(bvid, cid, cookies)
-                if sub_info:
-                    for sub in sub_info:
-                        sub_data = self.subtitle_proc.download_subtitle(sub["subtitle_url"])
-                        if sub_data:
-                            srt_path = self.subtitle_proc.save_srt(sub_data, video_path)
-                            lang = sub.get("lan_doc", "")
-                            self.after(0, lambda l=lang, p=srt_path: self._log(
-                                f"字幕已保存: {os.path.basename(p)} ({l})", SUCCESS))
-                else:
-                    self.after(0, lambda: self._log("该视频暂无CC字幕", WARNING))
-            else:
-                self.after(0, lambda: self._log("无法获取视频信息，跳过字幕下载", WARNING))
+            ids = self._resolve_video_ids()
+            bvid = ids.get("bvid") or (self._video_info or {}).get("bvid", "")
+            cid = int(ids.get("cid") or 0)
+            if not cid or not bvid:
+                self.after(0, lambda: self._log(
+                    "无法获取视频信息（缺 bvid/cid），跳过字幕下载", WARNING))
+                return
+
+            cookies = self._get_cookies()
+            sub_info = self.subtitle_proc.get_subtitle_info(bvid, cid, cookies)
+            if not sub_info:
+                self.after(0, lambda: self._log("该视频暂无CC字幕", WARNING))
+                return
+
+            saved = 0
+            for sub in sub_info:
+                sub_data = self.subtitle_proc.download_subtitle(sub["subtitle_url"])
+                if not sub_data:
+                    continue
+                srt_path = self.subtitle_proc.save_srt(sub_data, video_path)
+                lang = sub.get("lan_doc", "")
+                saved += 1
+                self.after(0, lambda l=lang, p=srt_path: self._log(
+                    f"字幕已保存: {p} ({l})", SUCCESS))
+            if not saved:
+                self.after(0, lambda: self._log("字幕下载失败（接口返回为空）", WARNING))
         except Exception as e:
-            self.after(0, lambda: self._log(f"字幕下载失败: {e}", ERROR))
+            self.after(0, lambda err=e: self._log(f"字幕下载失败: {err}", ERROR))
 
     # ── 设置对话框 ──
 
@@ -1177,8 +1341,8 @@ class BiliGoApp(ctk.CTk):
             except Exception as e:
                 self.after(0, lambda: self._settings_qr_label.configure(
                     text="生成失败", image=""))
-                self.after(0, lambda: self._settings_qr_status.configure(
-                    text=f"错误: {e}", text_color=ERROR))
+                self.after(0, lambda err=e: self._settings_qr_status.configure(
+                    text=f"错误: {err}", text_color=ERROR))
                 self.after(0, lambda: self._settings_qr_refresh_btn.configure(text="重试"))
 
         threading.Thread(target=do_generate, daemon=True).start()
@@ -1267,7 +1431,7 @@ class BiliGoApp(ctk.CTk):
                 self._qr_poll_id = self.after(2000, lambda: self._poll_qrcode_inline(auth, dialog))
 
             except Exception as e:
-                self.after(0, lambda: self._log(f"轮询异常: {e}", ERROR))
+                self.after(0, lambda err=e: self._log(f"轮询异常: {err}", ERROR))
                 self._qr_poll_id = self.after(3000, lambda: self._poll_qrcode_inline(auth, dialog))
 
         threading.Thread(target=do_poll, daemon=True).start()
@@ -1371,7 +1535,7 @@ class BiliGoApp(ctk.CTk):
                 self.after(0, lambda: self._log(f"路径: {result}"))
                 self.after(0, lambda: self._check_ffmpeg())
             except Exception as e:
-                self.after(0, lambda: self._log(f"FFmpeg 安装失败: {e}", ERROR))
+                self.after(0, lambda err=e: self._log(f"FFmpeg 安装失败: {err}", ERROR))
                 self.after(0, lambda: self._log("请手动下载: https://ffmpeg.org/download.html", WARNING))
 
         threading.Thread(target=do_install, daemon=True).start()
@@ -1389,35 +1553,31 @@ class BiliGoApp(ctk.CTk):
         self.config.set("download_subtitle", self.subtitle_var.get())
         self.config.save()
 
+    def _resolve_video_ids(self) -> dict:
+        """解析出 cid / bvid / aid / ep_id，结果缓存起来（弹幕和字幕都要用）
+
+        yt-dlp 不返回 cid，所以必须自己查：番剧查 season 接口，普通投稿查 view 接口。
+        """
+        if self._video_ids.get("cid"):
+            return self._video_ids
+
+        url = self.url_entry.get().strip()
+        ids = BiliAuth.resolve_video_ids(url, self.config.get("sessdata", ""))
+
+        # 解析不到时，用 yt-dlp 已经拿到的信息补一次（比如 b23 短链）
+        if not ids.get("cid") and self._video_info:
+            bvid = self._video_info.get("bvid") or ""
+            if bvid:
+                ids = BiliAuth.resolve_video_ids(bvid, self.config.get("sessdata", ""))
+
+        self._video_ids = ids or {}
+        return self._video_ids
+
     def _get_cid(self) -> int:
-        """获取视频 CID（从视频信息或 API）"""
+        """获取视频 CID（番剧 ep 链接也能取到）"""
         if self._video_info and self._video_info.get("cid"):
-            return self._video_info["cid"]
-
-        # 尝试从 yt-dlp 的 last_info 中获取
-        try:
-            url = self.url_entry.get().strip()
-            import yt_dlp
-            opts = {"quiet": True, "no_warnings": True}
-            cookie_opt = self.config.get_ytdlp_cookie_option()
-            opts.update(cookie_opt)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                # yt-dlp 不直接暴露 cid，尝试从 entries 获取
-                if info.get("entries"):
-                    entry = info["entries"][0]
-                    # 从 url 中提取
-                    for f in entry.get("formats", []):
-                        manifest = f.get("manifest_url", "")
-                        if "cid=" in manifest:
-                            import re
-                            m = re.search(r"cid=(\d+)", manifest)
-                            if m:
-                                return int(m.group(1))
-        except Exception:
-            pass
-
-        return 0
+            return int(self._video_info["cid"])
+        return int(self._resolve_video_ids().get("cid") or 0)
 
     def _get_cookies(self) -> dict:
         """获取 Cookie 配置"""

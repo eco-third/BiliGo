@@ -21,6 +21,10 @@ QRCODE_GENERATE_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode
 QRCODE_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
 NAV_API_URL = "https://api.bilibili.com/x/web-interface/nav"
 
+# 取 cid / aid / bvid 的接口
+VIEW_API_URL = "https://api.bilibili.com/x/web-interface/view"      # 普通投稿：bvid 或 aid
+SEASON_API_URL = "https://api.bilibili.com/pgc/view/web/season"     # 番剧/影视：ep_id
+
 # B站扫码状态码（data.code）
 QRCODE_NOT_SCANNED = 86101
 QRCODE_SCANNED_WAITING = 86102
@@ -250,3 +254,83 @@ class BiliAuth:
         """通过B站API获取多P视频的分P信息（含缩略图），兼容旧调用"""
         detail = BiliAuth.fetch_video_detail(bvid)
         return detail.get("pages", [])
+
+    @staticmethod
+    def resolve_video_ids(url: str, sessdata: str = "") -> dict:
+        """把任意 B 站链接解析成 cid / bvid / aid / ep_id。
+
+        yt-dlp 不会返回 cid：番剧只给 episode_id / season_id，普通投稿只给 bvid。
+        而弹幕要 oid=cid、字幕要 bvid+cid（player/v2 不接受 ep_id），所以这里自己查：
+
+          · 番剧/影视  → pgc/view/web/season?ep_id=NNN   （返回剧集列表，含 cid/bvid/aid）
+          · 普通投稿  → x/web-interface/view?bvid=BV...  （返回 cid/aid）
+
+        Args:
+            url: 视频链接（支持 /video/BVxxx、/video/av123、/bangumi/play/ep123）
+            sessdata: 可选，带上登录态的 SESSDATA 能查到更完整的信息
+        Returns:
+            dict: {"cid": int, "bvid": str, "aid": int, "ep_id": int, "season_id": int}
+            查不到时返回 {}（调用方据此提示"无法获取 CID"）
+        """
+        if not url:
+            return {}
+
+        ep_match = re.search(r"ep(\d+)", url, re.I)
+        bv_match = re.search(r"(BV[0-9A-Za-z]{10})", url)
+        av_match = re.search(r"/av(\d+)", url, re.I)
+
+        cookies = {"SESSDATA": sessdata} if sessdata else None
+        try:
+            # ── 番剧 / 影视 ──
+            if ep_match:
+                ep_id = int(ep_match.group(1))
+                resp = requests.get(
+                    SEASON_API_URL,
+                    params={"ep_id": ep_id},
+                    headers=HEADERS,
+                    cookies=cookies,
+                    timeout=15,
+                )
+                data = resp.json()
+                if data.get("code") != 0:
+                    return {}
+                result = data.get("result") or {}
+                episodes = result.get("episodes") or []
+                hit = next((e for e in episodes if e.get("id") == ep_id), None)
+                if hit is None and episodes:
+                    hit = episodes[0]
+                if not hit:
+                    return {}
+                return {
+                    "cid": int(hit.get("cid") or 0),
+                    "bvid": hit.get("bvid") or "",
+                    "aid": int(hit.get("aid") or 0),
+                    "ep_id": ep_id,
+                    "season_id": int(result.get("season_id") or 0),
+                }
+
+            # ── 普通投稿 ──
+            params = {}
+            if bv_match:
+                params["bvid"] = bv_match.group(1)
+            elif av_match:
+                params["aid"] = int(av_match.group(1))
+            else:
+                return {}
+
+            resp = requests.get(
+                VIEW_API_URL, params=params, headers=HEADERS, cookies=cookies, timeout=15
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                return {}
+            info = data.get("data") or {}
+            return {
+                "cid": int(info.get("cid") or 0),
+                "bvid": info.get("bvid") or (bv_match.group(1) if bv_match else ""),
+                "aid": int(info.get("aid") or 0),
+                "ep_id": 0,
+                "season_id": 0,
+            }
+        except Exception:
+            return {}

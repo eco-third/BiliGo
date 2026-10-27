@@ -8,11 +8,68 @@ import zipfile
 import shutil
 
 
+def _merge_format(height: int, exact: bool = False) -> str:
+    """生成「音视频分离流合并下载」的 yt-dlp format 字符串。
+
+    两个坑：
+      1. 竖屏视频（例如 B 站的 480P 竖屏是 480x852）width/height 是反的，
+         只按 height<=480 过滤会一条都匹配不到；
+      2. 纯 DASH 视频没有合并流，兜底的 /best（= 单个带音视频的文件）也会失败。
+    所以顺序是：按 height 选 → 按 width 选 → 最后兜底「任意视频 + 任意音频」。
+    """
+    op = "=" if exact else "<="
+    return (f"bv*[height{op}{height}]+ba"
+            f"/bv*[width{op}{height}]+ba"
+            f"/bv*+ba/b")
+
+
+def _single_format(height: int, exact: bool = False) -> str:
+    """无 FFmpeg 时用的：只下已合并的单文件流"""
+    op = "=" if exact else "<="
+    return f"b[height{op}{height}]/b[width{op}{height}]/b"
+
+
+# ── B 站自己的清晰度编号（qn）对应的名字 ──
+# 和网页播放器右下角的选择框一致。实际能选哪些，要看具体视频给了哪些格式。
+BILI_QN_LABELS = {
+    127: "8K 超高清",
+    126: "杜比视界",
+    125: "HDR 真彩",
+    120: "4K 超清",
+    122: "4K 超清",     # 4K 的高码率变体，播放器里同样显示成「4K 超清」
+    116: "1080P60",
+    112: "1080P 高码率",
+    80: "1080P",
+    74: "720P60",
+    64: "720P",
+    32: "480P",
+    16: "360P",
+}
+
+
+def quality_label(qn: int, width: int = 0, height: int = 0,
+                  fps: float = 0, dynamic_range: str = "SDR") -> str:
+    """把 yt-dlp 报的 qn 翻译成 B 站播放器里的清晰度名字。
+
+    qn 不在表里时，用「分辨率 + 60帧 + HDR」拼一个，保证不会出现空名字。
+    """
+    label = BILI_QN_LABELS.get(int(qn or 0))
+    if label:
+        return label
+    short = min(height, width) if (width and height) else height
+    label = f"{short}P" if short else "未知清晰度"
+    if (fps or 0) >= 50:
+        label += "60"
+    if (dynamic_range or "SDR").upper() not in ("SDR", ""):
+        label += " HDR"
+    return label
+
+
 class Config:
     """应用配置管理，自动持久化到本地JSON文件"""
 
     APP_NAME = "BiliGo"
-    VERSION = "1.1.0"
+    VERSION = "1.2.0"
 
     # 默认配色
     COLORS = {
@@ -31,22 +88,22 @@ class Config:
     # 画质映射 (显示名 -> yt-dlp format)
     # 需要 FFmpeg 的格式（音视频分离流）
     QUALITY_MAP_MERGE = {
-        "4K 超清": "bestvideo[height<=2160]+bestaudio/bestvideo+bestaudio/best",
-        "1080P 高码率": "bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best",
-        "1080P": "bestvideo[height=1080]+bestaudio/bestvideo+bestaudio/best",
-        "720P": "bestvideo[height<=720]+bestaudio/best",
-        "480P": "bestvideo[height<=480]+bestaudio/best",
-        "360P": "worstvideo+worstaudio/worst",
+        "4K 超清": _merge_format(2160),
+        "1080P 高码率": _merge_format(1080),
+        "1080P": _merge_format(1080, exact=True),
+        "720P": _merge_format(720),
+        "480P": _merge_format(480),
+        "360P": "wv*[height<=360]+wa/wv*[width<=360]+wa/wv*+wa/w",
     }
 
     # 无 FFmpeg 时使用的格式（下载已合并流，无需合并）
     QUALITY_MAP_NO_MERGE = {
-        "4K 超清": "best[height<=2160]/best",
-        "1080P 高码率": "best[height<=1080]/best",
-        "1080P": "best[height=1080]/best",
-        "720P": "best[height<=720]/best",
-        "480P": "best[height<=480]/best",
-        "360P": "worst",
+        "4K 超清": _single_format(2160),
+        "1080P 高码率": _single_format(1080),
+        "1080P": _single_format(1080, exact=True),
+        "720P": _single_format(720),
+        "480P": _single_format(480),
+        "360P": "wv*[height<=360]/wv*[width<=360]/w",
     }
 
     QUALITY_LIST = list(QUALITY_MAP_MERGE.keys())
@@ -85,7 +142,7 @@ class Config:
 
         return {
             "download_path": download_path,
-            "quality": "4K 超清",
+            "quality": "1080P",    # 默认 1080P，和 B 站网页一致；实际可选档位由视频决定
             "download_danmaku": True,
             "download_subtitle": True,
             "burn_danmaku": False,
