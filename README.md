@@ -8,6 +8,22 @@ B 站视频下载器 —— Python + CustomTkinter 暗色 GUI，下载引擎基�
 
 ---
 
+## 下载
+
+不想装 Python 的话，直接拿打包好的 Windows x64 版本（解压即用，已内置 FFmpeg 与 aria2c）：
+
+| 版本 | 说明 |
+| --- | --- |
+| [v1.1.0](https://github.com/eco-third/BiliGo/releases/tag/v1.1.0) | 当前版本。新增 aria2c 多连接加速、浏览器 Cookie 导入、友好错误提示 |
+| [v1.0.0](https://github.com/eco-third/BiliGo/releases/tag/v1.0.0) | 首个公开版本。无 aria2c 加速，仅支持扫码登录 / 手动 SESSDATA |
+
+每个 Release 都附 `*-win64.zip`（程序 + FFmpeg + aria2c）与 `*-source.zip`（源码备份）。
+Release 资产里**不含任何 Cookie**：`config/config.json` 与 `config/cookies.txt` 在首次运行时生成。
+
+> 仓库 `main` 分支对应 v1.1.0 源码，且额外加了本 README 与 `.gitignore`；`*-source.zip` 是原始源码快照。
+
+---
+
 ## 功能
 
 **解析与下载**
